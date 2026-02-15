@@ -12,42 +12,37 @@ from typing import Any, Dict, List, Iterable, Optional, Tuple
 
 import yaml
 
+from rich.console import Console
+from rich.live import Live
+from rich.layout import Layout
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    BarColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.align import Align
 
-# -------- regex patterns --------
+
+# --------- Regex patterns ----------
 RUN_SAVED_RE = re.compile(r"Run saved to:\s*(.+)$")
-PROGRESS_RE = re.compile(r"\[PROGRESS\]\s+epoch=(\d+)/(\d+)\s+step=(\d+)\s+loss=([0-9.]+)")
+# Expected line example:
+# [PROGRESS] epoch=1/5 iter=20/235 step=20 loss=4.4940 i2t@1=0.0312 t2i@1=0.0312
+PROGRESS_RE = re.compile(
+    r"\[PROGRESS\]\s+epoch=(\d+)/(\d+)\s+iter=(\d+)/(\d+)\s+step=(\d+)\s+loss=([0-9.]+)\s+i2t@1=([0-9.]+)\s+t2i@1=([0-9.]+)"
+)
 
 
-# -------- formatting --------
+# --------- Small helpers ----------
 def now_stamp() -> str:
     return time.strftime("%Y%m%d_%H%M%S")
 
 
-def fmt_seconds(s: Optional[float]) -> str:
-    if s is None:
-        return "??:??"
-    s = max(0.0, float(s))
-    h = int(s // 3600)
-    m = int((s % 3600) // 60)
-    sec = int(s % 60)
-    if h > 0:
-        return f"{h:02d}:{m:02d}:{sec:02d}"
-    return f"{m:02d}:{sec:02d}"
-
-
-def fmt_eta(elapsed: float, done: int, total: int) -> Optional[float]:
-    if done <= 0:
-        return None
-    avg = elapsed / done
-    remaining = (total - done) * avg
-    return remaining
-
-
-def print_line(msg: str) -> None:
-    print(msg, flush=True)
-
-
-# -------- config helpers --------
 def deep_set(d: Dict[str, Any], dotted_key: str, value: Any) -> None:
     keys = dotted_key.split(".")
     cur = d
@@ -61,6 +56,12 @@ def deep_set(d: Dict[str, Any], dotted_key: str, value: Any) -> None:
 def dump_yaml(path: Path, data: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+
+def product_dict(grid: Dict[str, List[Any]]) -> Iterable[Dict[str, Any]]:
+    keys = list(grid.keys())
+    for values in itertools.product(*[grid[k] for k in keys]):
+        yield dict(zip(keys, values))
 
 
 def format_tag(k: str, v: Any) -> str:
@@ -79,146 +80,345 @@ def build_run_name(base: str, params: Dict[str, Any], max_len: int = 140) -> str
     return name[:max_len]
 
 
-def product_dict(grid: Dict[str, List[Any]]) -> Iterable[Dict[str, Any]]:
-    keys = list(grid.keys())
-    for values in itertools.product(*[grid[k] for k in keys]):
-        yield dict(zip(keys, values))
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
 
 
-# -------- subprocess runners --------
-def run_cmd_quiet(cmd: List[str], env: Optional[Dict[str, str]], log_file: Optional[Path]) -> str:
-    """
-    Run and capture output (used for eval/collect/plots).
-    """
+# --------- Sparkline (ASCII graph) ----------
+SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+
+def sparkline(values: List[float], width: int = 60) -> str:
+    if not values:
+        return ""
+    # downsample to width
+    if len(values) > width:
+        step = len(values) / width
+        sampled = []
+        for i in range(width):
+            j = int(i * step)
+            sampled.append(values[j])
+        values = sampled
+
+    vmin = min(values)
+    vmax = max(values)
+    if vmax - vmin < 1e-12:
+        return SPARK_CHARS[0] * len(values)
+
+    out = []
+    for v in values:
+        t = (v - vmin) / (vmax - vmin)
+        idx = int(t * (len(SPARK_CHARS) - 1))
+        out.append(SPARK_CHARS[idx])
+    return "".join(out)
+
+
+def tail_lines(text: str, n: int = 40) -> str:
+    lines = text.splitlines()
+    return "\n".join(lines[-n:])
+
+
+# --------- Sweep config ----------
+@dataclass
+class SweepConfig:
+    runs_dir: str = "runs"
+    out_overrides_dir: str = "configs/_sweeps"
+    sweep_tag: str = "sweep"
+    eval_batch_size: int = 128
+    resume: bool = True
+    max_failures: int = 5
+
+    # UI tuning
+    spark_width: int = 60
+    max_points: int = 400  # keep last N progress points
+
+
+# --------- UI layout ----------
+def make_layout() -> Layout:
+    layout = Layout()
+
+    layout.split_column(
+        Layout(name="top", size=9),
+        Layout(name="mid", size=10),
+        Layout(name="bottom"),
+    )
+
+    layout["top"].split_row(
+        Layout(name="progress"),
+        Layout(name="status"),
+    )
+    layout["mid"].split_row(
+        Layout(name="sparks"),
+        Layout(name="params"),
+    )
+
+    return layout
+
+
+def make_status_panel(title: str, lines: List[str]) -> Panel:
+    txt = Text()
+    for ln in lines:
+        txt.append(ln + "\n")
+    return Panel(txt, title=title, border_style="cyan")
+
+
+def make_params_panel(params: Dict[str, Any]) -> Panel:
+    table = Table(show_header=False, box=None, pad_edge=False)
+    table.add_column(justify="right")
+    table.add_column()
+    for k, v in params.items():
+        table.add_row(k, str(v))
+    return Panel(table, title="Current params", border_style="magenta")
+
+
+def make_sparks_panel(loss_vals: List[float], i2t_vals: List[float], t2i_vals: List[float], width: int) -> Panel:
+    table = Table(show_header=False, box=None, pad_edge=False)
+    table.add_column(justify="right", width=10)
+    table.add_column()
+
+    table.add_row("loss", sparkline(loss_vals, width))
+    table.add_row("i2t@1", sparkline(i2t_vals, width))
+    table.add_row("t2i@1", sparkline(t2i_vals, width))
+    return Panel(table, title="Live metrics (sparkline)", border_style="green")
+
+
+# --------- Subprocess runners ----------
+def run_cmd_quiet(cmd: List[str], env: Optional[Dict[str, str]], log_file: Path) -> str:
     p = subprocess.run(cmd, capture_output=True, text=True, env=env)
     out = (p.stdout or "") + "\n" + (p.stderr or "")
 
-    if log_file is not None:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        with log_file.open("a", encoding="utf-8") as f:
-            f.write("\n" + "=" * 90 + "\n")
-            f.write("CMD: " + " ".join(cmd) + "\n")
-            f.write(out + "\n")
+    ensure_dir(log_file.parent)
+    with log_file.open("a", encoding="utf-8") as f:
+        f.write("\n" + "=" * 90 + "\n")
+        f.write("CMD: " + " ".join(cmd) + "\n")
+        f.write(out + "\n")
 
     if p.returncode != 0:
-        tail = "\n".join(out.splitlines()[-80:])
-        raise RuntimeError(f"Command failed ({p.returncode}): {' '.join(cmd)}\n--- tail ---\n{tail}")
-
+        raise RuntimeError(f"Command failed ({p.returncode}): {' '.join(cmd)}\n--- tail ---\n{tail_lines(out, 80)}")
     return out
 
 
-def run_train_stream(
+def run_train_stream_rich(
     cmd: List[str],
-    env: Optional[Dict[str, str]],
+    env: Dict[str, str],
     log_file: Path,
-    sweep_start: float,
-    done_before: int,
-    total_jobs: int,
+    ui: "SweepUI",
 ) -> Tuple[Path, float]:
     """
-    Stream stdout of training process in real-time.
-    Returns: (run_dir, train_seconds)
+    Runs training and streams stdout. Updates UI by parsing [PROGRESS] lines.
+    Returns: run_dir, train_seconds
     """
-    log_file.parent.mkdir(parents=True, exist_ok=True)
+    ensure_dir(log_file.parent)
     t0 = time.time()
-
     run_dir: Optional[Path] = None
-    last_epoch: Optional[int] = None
-    total_epochs: Optional[int] = None
-    last_step: Optional[int] = None
-    last_loss: Optional[float] = None
 
     with log_file.open("a", encoding="utf-8") as lf:
         lf.write("\n" + "=" * 90 + "\n")
         lf.write("CMD: " + " ".join(cmd) + "\n")
 
-        p = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env,
-        )
-
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
         assert p.stdout is not None
+
         for line in p.stdout:
             line = line.rstrip("\n")
             lf.write(line + "\n")
 
-            # detect run dir
             m_run = RUN_SAVED_RE.search(line.strip())
             if m_run:
                 run_dir = Path(m_run.group(1).strip())
+                ui.set_run_dir(run_dir)
 
-            # parse progress
             m = PROGRESS_RE.search(line)
             if m:
-                e = int(m.group(1))
-                E = int(m.group(2))
-                step = int(m.group(3))
-                loss = float(m.group(4))
+                epoch = int(m.group(1))
+                epochs = int(m.group(2))
+                it = int(m.group(3))
+                iters = int(m.group(4))
+                step = int(m.group(5))
+                loss = float(m.group(6))
+                i2t = float(m.group(7))
+                t2i = float(m.group(8))
 
-                last_epoch, total_epochs = e, E
-                last_step, last_loss = step, loss
-
-                elapsed_run = time.time() - t0
-                eta_run = None
-                if e > 0:
-                    sec_per_epoch = elapsed_run / e
-                    eta_run = (E - e) * sec_per_epoch
-
-                elapsed_all = time.time() - sweep_start
-                eta_all = fmt_eta(elapsed_all, done_before, total_jobs)
-
-                print_line(
-                    f"    [train] epoch {e}/{E} | step={step} | loss={loss:.4f} | "
-                    f"eta_run={fmt_seconds(eta_run)} | sweep_ETA={fmt_seconds(eta_all)}"
-                )
+                ui.update_train_progress(epoch, epochs, it, iters, step, loss, i2t, t2i)
 
         ret = p.wait()
-        train_seconds = time.time() - t0
+
+    train_seconds = time.time() - t0
 
     if ret != 0:
-        raise RuntimeError(f"Training process failed ({ret}). See log: {log_file}")
+        raise RuntimeError(f"Training process failed ({ret}). See: {log_file}")
 
     if run_dir is None:
-        raise RuntimeError("Could not detect run_dir from train output. Ensure train.py prints 'Run saved to: ...'")
+        raise RuntimeError("Could not detect run_dir. Ensure train.py prints: 'Run saved to: ...'")
 
     return run_dir, train_seconds
 
 
-# -------- sweep config --------
-@dataclass
-class SweepConfig:
-    runs_dir: str = "runs"
-    eval_batch_size: int = 128
-    sweep_tag: str = "sweep"
-    out_overrides_dir: str = "configs/_sweeps"
-    resume: bool = True
-    max_failures: int = 5
+# --------- Rich UI controller ----------
+class SweepUI:
+    def __init__(self, console: Console, total_jobs: int, spark_width: int, max_points: int):
+        self.console = console
+        self.total_jobs = total_jobs
+        self.spark_width = spark_width
+        self.max_points = max_points
+
+        self.layout = make_layout()
+
+        self.progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold]{task.description}[/bold]"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            expand=True,
+        )
+
+        self.task_sweep = self.progress.add_task("SWEEP", total=total_jobs)
+        self.task_epoch = self.progress.add_task("EPOCH", total=1)
+        self.task_iter = self.progress.add_task("ITER", total=1)
+
+        self.run_name: str = ""
+        self.run_dir: Optional[Path] = None
+        self.status_lines: List[str] = []
+
+        self.params: Dict[str, Any] = {}
+        self.loss_vals: List[float] = []
+        self.i2t_vals: List[float] = []
+        self.t2i_vals: List[float] = []
+
+        self.epoch = 0
+        self.epochs = 0
+        self.it = 0
+        self.iters = 0
+        self.step = 0
+
+    def set_job(self, idx: int, run_name: str, params: Dict[str, Any], ok: int, fail: int):
+        self.run_name = run_name
+        self.run_dir = None
+        self.params = params
+        self.loss_vals.clear()
+        self.i2t_vals.clear()
+        self.t2i_vals.clear()
+
+        # reset epoch/iter tasks (unknown until first PROGRESS)
+        self.progress.update(self.task_epoch, completed=0, total=1)
+        self.progress.update(self.task_iter, completed=0, total=1)
+
+        self.status_lines = [
+            f"job: {idx}/{self.total_jobs}",
+            f"ok: {ok}  fail: {fail}",
+            f"run: {run_name}",
+            "stage: TRAIN",
+        ]
+
+        self.refresh()
+
+    def set_stage(self, stage: str):
+        # update stage line
+        for i, ln in enumerate(self.status_lines):
+            if ln.startswith("stage:"):
+                self.status_lines[i] = f"stage: {stage}"
+                break
+        else:
+            self.status_lines.append(f"stage: {stage}")
+        self.refresh()
+
+    def set_run_dir(self, run_dir: Path):
+        self.run_dir = run_dir
+        # keep status line updated
+        self._set_or_add("run_dir", str(run_dir))
+        self.refresh()
+
+    def mark_sweep_done_one(self):
+        self.progress.advance(self.task_sweep, 1)
+        self.refresh()
+
+    def _set_or_add(self, key: str, value: str):
+        prefix = f"{key}:"
+        for i, ln in enumerate(self.status_lines):
+            if ln.startswith(prefix):
+                self.status_lines[i] = f"{prefix} {value}"
+                return
+        self.status_lines.append(f"{prefix} {value}")
+
+    def update_train_progress(self, epoch: int, epochs: int, it: int, iters: int, step: int, loss: float, i2t: float, t2i: float):
+        self.epoch, self.epochs = epoch, epochs
+        self.it, self.iters = it, iters
+        self.step = step
+
+        # update bars
+        self.progress.update(self.task_epoch, total=max(epochs, 1), completed=min(epoch, epochs))
+        self.progress.update(self.task_iter, total=max(iters, 1), completed=min(it, iters))
+
+        # store metrics
+        self.loss_vals.append(loss)
+        self.i2t_vals.append(i2t)
+        self.t2i_vals.append(t2i)
+        if len(self.loss_vals) > self.max_points:
+            self.loss_vals = self.loss_vals[-self.max_points :]
+            self.i2t_vals = self.i2t_vals[-self.max_points :]
+            self.t2i_vals = self.t2i_vals[-self.max_points :]
+
+        # status lines
+        self._set_or_add("epoch", f"{epoch}/{epochs}")
+        self._set_or_add("iter", f"{it}/{iters}")
+        self._set_or_add("step", str(step))
+        self._set_or_add("loss", f"{loss:.4f}")
+        self._set_or_add("i2t@1", f"{i2t:.4f}")
+        self._set_or_add("t2i@1", f"{t2i:.4f}")
+
+        self.refresh()
+
+    def set_message(self, msg: str):
+        self._set_or_add("msg", msg)
+        self.refresh()
+
+    def refresh(self):
+        # Left: progress bars
+        self.layout["progress"].update(Panel(self.progress, title="Progress", border_style="blue"))
+
+        # Right: status
+        self.layout["status"].update(make_status_panel("Status", self.status_lines))
+
+        # Sparks
+        self.layout["sparks"].update(make_sparks_panel(self.loss_vals, self.i2t_vals, self.t2i_vals, self.spark_width))
+
+        # Params
+        self.layout["params"].update(make_params_panel(self.params))
+
+    def renderable(self):
+        return self.layout
 
 
+# --------- Main sweep ----------
 def main():
+    console = Console()
     cfg = SweepConfig()
-
-    # IMPORTANT: use current interpreter
     PY = os.sys.executable
 
-    # -------- GRID --------
+    # ---- GRID: редактируй тут ----
     grid = {
-        "model.text_encoder.pooling": ["cls", "mean"],
-        "model.text_encoder.unfreeze_last_n": [0, 2, 4],
+        "model.text_encoder.pooling": ["mean", "cls"],
+        "model.text_encoder.unfreeze_last_n": [0, 1, 2, 4],
+        "train.lr_text": [1e-5, 2e-5, 5e-5],
         "model.projection.type": ["linear", "mlp"],
-        "train.lr_text": [2e-5, 5e-5],
+        "train.weight_decay": [0.01, 0.05],
         "data.batch_size": [128],
-        "train.epochs": [5],
+        "train.epochs": [10],
+        "train.lr": [1e-3],
     }
+
 
     sweep_id = f"{cfg.sweep_tag}_{now_stamp()}"
     overrides_root = Path(cfg.out_overrides_dir) / sweep_id
-    overrides_root.mkdir(parents=True, exist_ok=True)
+    ensure_dir(overrides_root)
 
-    # Prepare jobs
+    sweep_log = Path(cfg.runs_dir) / f"{sweep_id}_sweep.log"
+    err_log = Path(cfg.runs_dir) / f"{sweep_id}_errors.log"
+    ensure_dir(Path(cfg.runs_dir))
+
+    # Prepare jobs list
     jobs: List[Tuple[str, Dict[str, Any], Path]] = []
     for idx, params in enumerate(product_dict(grid), start=1):
         run_name = build_run_name(f"{sweep_id}__{idx:03d}", params)
@@ -235,151 +435,139 @@ def main():
         jobs.append((run_name, params, override_path))
 
     total = len(jobs)
-    start_all = time.time()
-
-    sweep_log = Path(cfg.runs_dir) / f"{sweep_id}_sweep.log"
-    err_log = Path(cfg.runs_dir) / f"{sweep_id}_errors.log"
+    ui = SweepUI(console, total_jobs=total, spark_width=cfg.spark_width, max_points=cfg.max_points)
 
     results: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
     ok = 0
     failed = 0
-    done = 0
 
-    print_line("\n=== SWEEP START ===")
-    print_line(f"sweep_id: {sweep_id}")
-    print_line(f"jobs: {total}")
-    print_line(f"python: {PY}")
-    print_line(f"overrides: {overrides_root}")
-    print_line(f"log: {sweep_log}")
-    print_line(f"errors: {err_log}\n")
+    start_all = time.time()
 
-    for i, (run_name, params, override_path) in enumerate(jobs, start=1):
-        elapsed = time.time() - start_all
-        eta_all = fmt_eta(elapsed, done, total)
+    console.print(f"[bold cyan]SWEEP[/bold cyan] id={sweep_id} jobs={total} python={PY}")
+    console.print(f"overrides: {overrides_root}")
+    console.print(f"log: {sweep_log}")
+    console.print(f"errors: {err_log}")
+    console.print()
 
-        header = (
-            f"[{i:03d}/{total:03d}] "
-            f"elapsed={fmt_seconds(elapsed)} "
-            f"avg/run={fmt_seconds(elapsed/done) if done>0 else '??:??'} "
-            f"ETA={fmt_seconds(eta_all)} | "
-            f"ok={ok} fail={failed} | "
-            f"{run_name}"
-        )
-        print_line(header)
+    with Live(ui.renderable(), console=console, refresh_per_second=12):
+        for i, (run_name, params, override_path) in enumerate(jobs, start=1):
+            # Resume check
+            run_dir_guess = Path(cfg.runs_dir) / run_name
+            if cfg.resume and run_dir_guess.exists() and (run_dir_guess / "full_eval_val.json").exists():
+                ui.set_job(i, run_name, params, ok, failed)
+                ui.set_stage("SKIP (resume)")
+                ui.set_message("full_eval_val.json exists")
+                ui.mark_sweep_done_one()
 
-        env = os.environ.copy()
-        env["OVERRIDE_CFG"] = str(override_path)
+                results.append({
+                    "idx": i,
+                    "run_name": run_name,
+                    "override_cfg": str(override_path),
+                    "run_dir": str(run_dir_guess),
+                    "status": "skipped",
+                })
+                continue
 
-        run_dir_guess = Path(cfg.runs_dir) / run_name
-        if cfg.resume and run_dir_guess.exists() and (run_dir_guess / "full_eval_val.json").exists():
-            print_line(f"  └─ SKIP (resume): found {run_dir_guess/'full_eval_val.json'}\n")
+            ui.set_job(i, run_name, params, ok, failed)
+
+            env = os.environ.copy()
+            env["OVERRIDE_CFG"] = str(override_path)
+
+            status = "ok"
+            run_dir: Optional[Path] = None
+
+            # ---- TRAIN (stream + UI updates) ----
+            try:
+                ui.set_stage("TRAIN")
+                run_dir, train_sec = run_train_stream_rich(
+                    [PY, "-m", "mini_clip.train"],
+                    env=env,
+                    log_file=sweep_log,
+                    ui=ui,
+                )
+                ui.set_message(f"train_done={train_sec:.1f}s")
+            except Exception as e:
+                status = "train_failed"
+                failed += 1
+                failures.append({"run_name": run_name, "stage": "train", "error": repr(e)})
+                ensure_dir(err_log.parent)
+                with err_log.open("a", encoding="utf-8") as f:
+                    f.write(f"\n[{run_name}] TRAIN FAILED\n{repr(e)}\n")
+
+            # ---- EVAL ----
+            if status == "ok" and run_dir is not None:
+                try:
+                    ui.set_stage("EVAL (full) val+test")
+                    run_cmd_quiet(
+                        [PY, "scripts/eval_run.py", "--run_dir", str(run_dir), "--batch_size", str(cfg.eval_batch_size)],
+                        env=env,
+                        log_file=sweep_log,
+                    )
+                    ui.set_message("eval_done")
+                except Exception as e:
+                    status = "eval_failed"
+                    failed += 1
+                    failures.append({"run_name": run_name, "stage": "eval", "error": repr(e)})
+                    ensure_dir(err_log.parent)
+                    with err_log.open("a", encoding="utf-8") as f:
+                        f.write(f"\n[{run_name}] EVAL FAILED\n{repr(e)}\n")
+
+            if status == "ok":
+                ok += 1
+
             results.append({
-                "idx": i, "run_name": run_name, "override_cfg": str(override_path),
-                "run_dir": str(run_dir_guess), "status": "skipped",
+                "idx": i,
+                "run_name": run_name,
+                "override_cfg": str(override_path),
+                "run_dir": str(run_dir) if run_dir else str(run_dir_guess),
+                "status": status,
             })
-            done += 1
-            continue
 
-        status = "ok"
-        run_dir: Optional[Path] = None
+            ui.set_stage(f"DONE ({status})")
+            ui.mark_sweep_done_one()
 
-        # ---- TRAIN (stream) ----
-        try:
-            print_line("  ├─ TRAIN ...")
-            run_dir, train_sec = run_train_stream(
-                [PY, "-m", "mini_clip.train"],
-                env=env,
-                log_file=sweep_log,
-                sweep_start=start_all,
-                done_before=done,
-                total_jobs=total,
-            )
-            print_line(f"  │  ✓ TRAIN done in {fmt_seconds(train_sec)} | run_dir={run_dir}")
-        except Exception as e:
-            status = "train_failed"
-            failed += 1
-            print_line(f"  │  ✗ TRAIN FAILED | {e}\n")
-            err_log.parent.mkdir(parents=True, exist_ok=True)
-            with err_log.open("a", encoding="utf-8") as f:
-                f.write(f"\n[{run_name}] TRAIN FAILED\n{repr(e)}\n")
-            failures.append({"run_name": run_name, "stage": "train", "error": repr(e)})
-            results.append({
-                "idx": i, "run_name": run_name, "override_cfg": str(override_path),
-                "run_dir": str(run_dir_guess), "status": status,
-            })
-            done += 1
             if failed >= cfg.max_failures:
-                print_line("Stopping: reached max_failures.\n")
+                ui.set_message("Stopping: max_failures reached")
                 break
-            continue
 
-        # ---- EVAL ----
+        # finalize: collect + plots
+        ui.set_stage("COLLECT RESULTS")
         try:
-            print_line("  ├─ EVAL (full) val+test ...")
             run_cmd_quiet(
-                [PY, "scripts/eval_run.py", "--run_dir", str(run_dir), "--batch_size", str(cfg.eval_batch_size)],
-                env=env,
+                [PY, "scripts/collect_results.py", "--runs_dir", cfg.runs_dir, "--out_csv", "runs/results.csv", "--metric", "val_i2t_R@1"],
+                env=None,
                 log_file=sweep_log,
             )
-            print_line("  │  ✓ EVAL done")
+            ui.set_message("saved runs/results.csv")
         except Exception as e:
-            status = "eval_failed"
-            failed += 1
-            print_line(f"  │  ✗ EVAL FAILED | {e}")
-            err_log.parent.mkdir(parents=True, exist_ok=True)
-            with err_log.open("a", encoding="utf-8") as f:
-                f.write(f"\n[{run_name}] EVAL FAILED\n{repr(e)}\n")
-            failures.append({"run_name": run_name, "stage": "eval", "error": repr(e)})
+            ui.set_message(f"collect_failed: {e}")
 
-        if status == "ok":
-            ok += 1
+        ui.set_stage("PLOTS")
+        try:
+            run_cmd_quiet(
+                [PY, "scripts/plot_results.py", "--csv", "runs/results.csv", "--out_dir", "runs/plots", "--metric", "val_i2t_R@1", "--topk", "15"],
+                env=None,
+                log_file=sweep_log,
+            )
+            ui.set_message("saved runs/plots/*.png")
+        except Exception as e:
+            ui.set_message(f"plot_failed: {e}")
 
-        results.append({
-            "idx": i,
-            "run_name": run_name,
-            "override_cfg": str(override_path),
-            "run_dir": str(run_dir),
-            "status": status,
-        })
-        done += 1
-        print_line(f"  └─ DONE status={status}\n")
-
-    # ---- finalize ----
-    elapsed_total = time.time() - start_all
-    print_line("\n=== SWEEP FINISH ===")
-    print_line(f"ok={ok} failed={failed} done={done}/{total} elapsed={fmt_seconds(elapsed_total)}")
+    elapsed = time.time() - start_all
 
     manifest = Path(cfg.runs_dir) / f"{sweep_id}_manifest.json"
     manifest.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-    print_line(f"manifest: {manifest}")
 
     if failures:
         fail_path = Path(cfg.runs_dir) / f"{sweep_id}_failures.json"
         fail_path.write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding="utf-8")
-        print_line(f"failures: {fail_path}")
 
-    # collect + plots
-    try:
-        print_line("\n=== COLLECT RESULTS ===")
-        run_cmd_quiet(
-            [PY, "scripts/collect_results.py", "--runs_dir", cfg.runs_dir, "--out_csv", "runs/results.csv", "--metric", "val_i2t_R@1"],
-            env=None,
-            log_file=sweep_log,
-        )
-        print_line("Saved: runs/results.csv")
-
-        print_line("\n=== PLOTS ===")
-        run_cmd_quiet(
-            [PY, "scripts/plot_results.py", "--csv", "runs/results.csv", "--out_dir", "runs/plots", "--metric", "val_i2t_R@1", "--topk", "15"],
-            env=None,
-            log_file=sweep_log,
-        )
-        print_line("Saved: runs/plots/*.png")
-    except Exception as e:
-        print_line(f"Collect/plots skipped due to error: {e}")
-
-    print_line("\nDone.\n")
+    console.print()
+    console.print(f"[bold green]DONE[/bold green] ok={ok} failed={failed} elapsed={elapsed:.1f}s")
+    console.print(f"manifest: {manifest}")
+    if failures:
+        console.print(f"failures: {Path(cfg.runs_dir) / f'{sweep_id}_failures.json'}")
 
 
 if __name__ == "__main__":

@@ -125,7 +125,17 @@ def main():
                     }
                     f.write(json.dumps(log) + "\n")
                     f.flush()
-                    print(f"[PROGRESS] epoch={epoch}/{epochs} step={global_step} loss={loss.item():.4f}", flush=True)
+                    iters_per_epoch = len(train_loader)
+                    iter_in_epoch = it + 1  # если it начинается с 0
+
+                    i2t = m.get("train_batch_i2t_R@1", m.get("i2t_R@1", 0.0))
+                    t2i = m.get("train_batch_t2i_R@1", m.get("t2i_R@1", 0.0))
+
+                    print(
+                        f"[PROGRESS] epoch={epoch}/{epochs} iter={iter_in_epoch}/{iters_per_epoch} "
+                        f"step={global_step} loss={loss.item():.4f} i2t@1={float(i2t):.4f} t2i@1={float(t2i):.4f}",
+                        flush=True
+                    )
 
 
                     pbar.set_postfix({
