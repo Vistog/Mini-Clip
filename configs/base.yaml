@@ -8,7 +8,7 @@ run:
 data:
   dataset: flickr8k
   root: data/flickr8k
-  batch_size: 32
+  batch_size: 128
   num_workers: 2
   image_size: 224
   max_length: 32
@@ -22,7 +22,8 @@ model:
   text_encoder:
     name: distilbert-base-uncased
     trainable: false
-    pooling: cls  # cls или mean
+    pooling: mean
+    unfreeze_last_n: 2
   projection:
     type: linear  # linear или mlp
     hidden_dim: 1024
@@ -35,9 +36,11 @@ loss:
   type: clip_inbatch
 
 train:
-  epochs: 5
-  lr: 1.0e-3
+  epochs: 100
+  lr: 1.0e-4
+  lr_text: 2.0e-5
+  lr_image: 1.0e-5
   weight_decay: 1.0e-4
   log_every: 20
-  save_every: 1
+  save_every: 10
   amp: true

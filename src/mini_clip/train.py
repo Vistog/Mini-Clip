@@ -1,13 +1,5 @@
 from __future__ import annotations
 
-import warnings
-warnings.filterwarnings("ignore", category=FutureWarning)
-
-from transformers.utils import logging as hf_logging
-hf_logging.set_verbosity_error()
-hf_logging.disable_progress_bar()
-
-
 import os
 import json
 import time
@@ -24,6 +16,12 @@ from mini_clip.data.datamodule import make_train_val_loaders, Batch
 from mini_clip.losses.clip_loss import CLIPInBatchLoss
 from mini_clip.losses.metrics import retrieval_metrics
 
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+from transformers.utils import logging as hf_logging
+hf_logging.set_verbosity_error()
+hf_logging.disable_progress_bar()
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -113,9 +111,11 @@ def main():
 
                 if global_step % log_every == 0:
                     m = retrieval_metrics(logits_i.detach(), logits_t.detach(), ks=(1, 5))
+                    m = {f"train_batch_{k}": v for k, v in m.items()}  # <— главное
+
                     log = {
                         "time": time.time(),
-                        "split": "train",
+                        "split": "train_batch",  # <— чтобы не путать с full val/test
                         "epoch": epoch,
                         "iter": it,
                         "step": global_step,
@@ -125,7 +125,12 @@ def main():
                     }
                     f.write(json.dumps(log) + "\n")
                     f.flush()
-                    pbar.set_postfix({k: round(log[k], 4) for k in ("loss", "i2t_R@1", "t2i_R@1")})
+
+                    pbar.set_postfix({
+                        "loss": round(log["loss"], 4),
+                        "i2t@1": round(log["train_batch_i2t_R@1"], 4),
+                        "t2i@1": round(log["train_batch_t2i_R@1"], 4),
+                    })
 
             # val at end of epoch
             val_m = evaluate_epoch(model, val_loader, device, amp)

@@ -14,6 +14,7 @@ from mini_clip.data.datasets import FakeCLIPDataset, Flickr8kDataset
 class Batch:
     images: torch.Tensor
     text: Dict[str, torch.Tensor]
+    image_names: Optional[List[str]] = None
 
 
 class CLIPCollator:
@@ -21,8 +22,15 @@ class CLIPCollator:
         self.tok = AutoTokenizer.from_pretrained(tokenizer_name)
         self.max_length = int(max_length)
 
-    def __call__(self, items: List[Tuple[torch.Tensor, str]]) -> Batch:
-        images, texts = zip(*items)
+    def __call__(self, items):
+        # items могут быть (img, txt) или (img, txt, name)
+        if len(items[0]) == 3:
+            images, texts, names = zip(*items)
+            names = list(names)
+        else:
+            images, texts = zip(*items)
+            names = None
+
         images = torch.stack(list(images), dim=0)
         text_batch = self.tok(
             list(texts),
@@ -31,7 +39,7 @@ class CLIPCollator:
             max_length=self.max_length,
             return_tensors="pt",
         )
-        return Batch(images=images, text=dict(text_batch))
+        return Batch(images=images, text=dict(text_batch), image_names=names)
 
 
 def _make_loader(ds, cfg: dict, shuffle: bool) -> DataLoader:

@@ -112,4 +112,5 @@ class Flickr8kDataset(Dataset):
         with Image.open(path) as im:
             im = im.convert("RGB")
             x = self.transform(im)
-        return x, caption
+        return x, caption, img_name
+
