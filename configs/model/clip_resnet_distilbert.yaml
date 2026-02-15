@@ -1,0 +1,8 @@
+model:
+  image_encoder:
+    name: resnet50
+    pretrained: true
+    trainable: false
+  text_encoder:
+    name: distilbert-base-uncased
+    trainable: false

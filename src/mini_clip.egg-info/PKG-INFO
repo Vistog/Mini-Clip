@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: mini-clip
+Version: 0.1.0
+Summary: Mini-CLIP research codebase
+Requires-Python: >=3.10
+Requires-Dist: torch
+Requires-Dist: torchvision
+Requires-Dist: transformers
+Requires-Dist: pyyaml
+Requires-Dist: tqdm

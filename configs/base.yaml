@@ -1,0 +1,43 @@
+seed: 42
+device: cuda
+
+run:
+  out_dir: runs
+  name: null  # если null — сгенерируем автоматически
+
+data:
+  dataset: fake
+  batch_size: 32
+  num_workers: 0
+  image_size: 224
+  max_length: 32
+
+
+model:
+  embed_dim: 512
+  image_encoder:
+    name: resnet50
+    pretrained: true
+    trainable: false
+  text_encoder:
+    name: distilbert-base-uncased
+    trainable: false
+    pooling: cls  # cls или mean
+  projection:
+    type: linear  # linear или mlp
+    hidden_dim: 1024
+    dropout: 0.0
+  temperature:
+    learnable: true
+    init: 0.07
+
+loss:
+  type: clip_inbatch
+
+train:
+  epochs: 5
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  log_every: 50
+  save_every: 1
+  amp: true

@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+src/mini_clip/__init__.py
+src/mini_clip/eval.py
+src/mini_clip/factory.py
+src/mini_clip/infer.py
+src/mini_clip/registry.py
+src/mini_clip/train.py
+src/mini_clip.egg-info/PKG-INFO
+src/mini_clip.egg-info/SOURCES.txt
+src/mini_clip.egg-info/dependency_links.txt
+src/mini_clip.egg-info/requires.txt
+src/mini_clip.egg-info/top_level.txt
+src/mini_clip/models/clip.py
+src/mini_clip/utils/config.py
