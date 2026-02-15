@@ -6,12 +6,12 @@ run:
   name: null  # если null — сгенерируем автоматически
 
 data:
-  dataset: fake
+  dataset: flickr8k
+  root: data/flickr8k
   batch_size: 32
-  num_workers: 0
+  num_workers: 2
   image_size: 224
   max_length: 32
-
 
 model:
   embed_dim: 512
@@ -38,6 +38,6 @@ train:
   epochs: 5
   lr: 1.0e-3
   weight_decay: 1.0e-4
-  log_every: 50
+  log_every: 20
   save_every: 1
   amp: true

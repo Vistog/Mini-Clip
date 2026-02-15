@@ -1,20 +1,26 @@
 from __future__ import annotations
 
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+from transformers.utils import logging as hf_logging
+hf_logging.set_verbosity_error()
+hf_logging.disable_progress_bar()
+
+
 import os
 import json
 import time
-import math
 import random
-from typing import Dict, Any
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 
 from mini_clip.utils.config import load_config, make_run_dir, save_config
 from mini_clip.factory import build_model
-from mini_clip.data.datamodule import make_train_loader, Batch
+from mini_clip.data.datamodule import make_train_val_loaders, Batch
 from mini_clip.losses.clip_loss import CLIPInBatchLoss
 from mini_clip.losses.metrics import retrieval_metrics
 
@@ -32,45 +38,48 @@ def to_device(batch: Batch, device: torch.device) -> Batch:
     return Batch(images=images, text=text)
 
 
+@torch.no_grad()
+def evaluate_epoch(model: nn.Module, loader, device: torch.device, amp: bool) -> dict:
+    model.eval()
+    all_logs = []
+    for batch in tqdm(loader, desc="val", leave=False):
+        batch = to_device(batch, device)
+        with autocast(device_type="cuda", enabled=amp):
+            logits_i, logits_t = model(batch.images, batch.text)
+        m = retrieval_metrics(logits_i, logits_t, ks=(1, 5, 10))
+        all_logs.append(m)
+
+    # усреднение по батчам (быстро и достаточно для начала)
+    out = {}
+    for k in all_logs[0].keys():
+        out[k] = float(sum(d[k] for d in all_logs) / len(all_logs))
+    model.train()
+    return out
+
+
 def save_ckpt(model: nn.Module, optim: torch.optim.Optimizer, epoch: int, run_dir: str) -> None:
     path = os.path.join(run_dir, "checkpoints", f"epoch_{epoch:03d}.pt")
-    torch.save(
-        {
-            "epoch": epoch,
-            "model": model.state_dict(),
-            "optimizer": optim.state_dict(),
-        },
-        path,
-    )
+    torch.save({"epoch": epoch, "model": model.state_dict(), "optimizer": optim.state_dict()}, path)
 
 
 def main():
-    # 1) config
     cfg = load_config("configs/base.yaml", os.environ.get("OVERRIDE_CFG"))
-    if os.environ.get("OVERRIDE_CFG") is None:
-        # если не задан override — просто base
-        pass
-
     set_seed(int(cfg["seed"]))
 
-    # 2) run dir
     run_dir = make_run_dir(cfg["run"]["out_dir"], cfg["run"].get("name"))
     save_config(cfg, run_dir)
 
-    # 3) device
     use_cuda = (cfg.get("device") == "cuda") and torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
 
-    # 4) data
-    loader = make_train_loader(cfg)
+    train_loader, val_loader = make_train_val_loaders(cfg)
 
-    # 5) model
     model = build_model(cfg).to(device)
     model.train()
 
-    # 6) loss + optim
     criterion = CLIPInBatchLoss()
     tcfg = cfg["train"]
+
     optim = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=float(tcfg["lr"]),
@@ -78,9 +87,8 @@ def main():
     )
 
     amp = bool(tcfg.get("amp", True)) and use_cuda
-    scaler = GradScaler(enabled=amp)
+    scaler = GradScaler("cuda", enabled=amp)
 
-    # 7) training
     metrics_path = os.path.join(run_dir, "metrics.jsonl")
     log_every = int(tcfg["log_every"])
     epochs = int(tcfg["epochs"])
@@ -89,14 +97,13 @@ def main():
     global_step = 0
     with open(metrics_path, "a", encoding="utf-8") as f:
         for epoch in range(1, epochs + 1):
-            pbar = tqdm(loader, desc=f"epoch {epoch}/{epochs}", leave=True)
+            pbar = tqdm(train_loader, desc=f"train epoch {epoch}/{epochs}", leave=True)
             for it, batch in enumerate(pbar, start=1):
                 global_step += 1
                 batch = to_device(batch, device)
 
                 optim.zero_grad(set_to_none=True)
-
-                with autocast(enabled=amp):
+                with autocast(device_type="cuda", enabled=amp):
                     logits_i, logits_t = model(batch.images, batch.text)
                     loss = criterion(logits_i, logits_t)
 
@@ -108,6 +115,7 @@ def main():
                     m = retrieval_metrics(logits_i.detach(), logits_t.detach(), ks=(1, 5))
                     log = {
                         "time": time.time(),
+                        "split": "train",
                         "epoch": epoch,
                         "iter": it,
                         "step": global_step,
@@ -117,7 +125,13 @@ def main():
                     }
                     f.write(json.dumps(log) + "\n")
                     f.flush()
-                    pbar.set_postfix({k: (round(v, 4) if isinstance(v, float) else v) for k, v in log.items() if k in ("loss","i2t_R@1","t2i_R@1","logit_scale")})
+                    pbar.set_postfix({k: round(log[k], 4) for k in ("loss", "i2t_R@1", "t2i_R@1")})
+
+            # val at end of epoch
+            val_m = evaluate_epoch(model, val_loader, device, amp)
+            val_log = {"time": time.time(), "split": "val", "epoch": epoch, **val_m}
+            f.write(json.dumps(val_log) + "\n")
+            f.flush()
 
             if epoch % save_every == 0:
                 save_ckpt(model, optim, epoch, run_dir)
