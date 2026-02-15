@@ -125,6 +125,8 @@ def main():
                     }
                     f.write(json.dumps(log) + "\n")
                     f.flush()
+                    print(f"[PROGRESS] epoch={epoch}/{epochs} step={global_step} loss={loss.item():.4f}", flush=True)
+
 
                     pbar.set_postfix({
                         "loss": round(log["loss"], 4),

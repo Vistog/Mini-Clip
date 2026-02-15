@@ -1,31 +1,42 @@
 from __future__ import annotations
 
 import os
+import json
 import argparse
 from pathlib import Path
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+# silence transformers / warnings (опционально, но очень чистит вывод)
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+from transformers.utils import logging as hf_logging
+hf_logging.set_verbosity_error()
+hf_logging.disable_progress_bar()
 
 from mini_clip.utils.config import load_config
 from mini_clip.factory import build_model
 from mini_clip.data.datamodule import CLIPCollator, Batch
 from mini_clip.data.datasets import Flickr8kDataset
 
-import warnings
-warnings.filterwarnings("ignore", category=FutureWarning)
 
-from transformers.utils import logging as hf_logging
-hf_logging.set_verbosity_error()
-hf_logging.disable_progress_bar()
+def load_checkpoint(model: torch.nn.Module, ckpt_path: str, device: torch.device) -> Dict[str, Any]:
+    ckpt_path = str(ckpt_path)
+    try:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    except TypeError:
+        # старый torch без weights_only
+        ckpt = torch.load(ckpt_path, map_location=device)
 
-
-def load_checkpoint(model: torch.nn.Module, ckpt_path: str, device: torch.device) -> None:
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-    state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
-    model.load_state_dict(state, strict=True)
+    if isinstance(ckpt, dict) and "model" in ckpt:
+        model.load_state_dict(ckpt["model"], strict=True)
+        return {"ckpt_path": ckpt_path, "epoch": ckpt.get("epoch", None)}
+    else:
+        model.load_state_dict(ckpt, strict=True)
+        return {"ckpt_path": ckpt_path, "epoch": None}
 
 
 @torch.no_grad()
@@ -76,8 +87,7 @@ def build_name_to_indices(names: List[str]) -> Dict[str, List[int]]:
 @torch.no_grad()
 def recall_i2t(sim: torch.Tensor, names: List[str], ks=(1, 5, 10)) -> Dict[str, float]:
     """
-    Image->Text:
-    Для каждой строки i (image_i) правильные тексты: все индексы j, у которых name[j] == name[i] (5 капшенов).
+    Image->Text: у одной картинки 5 captions => multi-positive.
     """
     name2idx = build_name_to_indices(names)
     N = sim.size(0)
@@ -98,9 +108,7 @@ def recall_i2t(sim: torch.Tensor, names: List[str], ks=(1, 5, 10)) -> Dict[str, 
 @torch.no_grad()
 def recall_t2i(sim_t: torch.Tensor, names: List[str], ks=(1, 5, 10)) -> Dict[str, float]:
     """
-    Text->Image:
-    sim_t: [N, N] = txt_embs @ img_embs.T (то есть logits_per_text)
-    Для текста i правильные изображения: все индексы j, у которых name[j] == name[i] (та же картинка).
+    Text->Image: правильные изображения = все пары с тем же image_name (та же картинка).
     """
     name2idx = build_name_to_indices(names)
     N = sim_t.size(0)
@@ -123,6 +131,7 @@ def main():
     ap.add_argument("--ckpt", type=str, default=None, help="path to checkpoint .pt (optional)")
     ap.add_argument("--split", type=str, default="val", choices=["train", "val", "test"])
     ap.add_argument("--batch_size", type=int, default=None, help="override batch size for eval")
+    ap.add_argument("--out_json", type=str, default=None, help="where to save json results (optional)")
     args = ap.parse_args()
 
     cfg = load_config("configs/base.yaml", os.environ.get("OVERRIDE_CFG"))
@@ -149,35 +158,43 @@ def main():
     device = torch.device("cuda" if use_cuda else "cpu")
 
     model = build_model(cfg).to(device)
+
+    ckpt_info: Dict[str, Any] = {"ckpt_path": None, "epoch": None}
     if args.ckpt is not None:
-        load_checkpoint(model, args.ckpt, device)
+        ckpt_info = load_checkpoint(model, args.ckpt, device)
 
     amp = bool(cfg["train"].get("amp", True)) and use_cuda
 
     img_embs, txt_embs, names = encode_dataset(model, loader, device, amp)
 
-    # Полная матрица similarity
-    # (уже нормализовано внутри encode_image/encode_text)
-    sim_i = img_embs @ txt_embs.t()          # [N, N] image->text
-    sim_t = sim_i.t().contiguous()           # [N, N] text->image
+    # full similarity matrix
+    sim_i = img_embs @ txt_embs.t()      # image->text
+    sim_t = sim_i.t().contiguous()       # text->image
 
-    m1 = recall_i2t(sim_i, names, ks=(1, 5, 10))
-    m2 = recall_t2i(sim_t, names, ks=(1, 5, 10))
+    m_i2t = recall_i2t(sim_i, names, ks=(1, 5, 10))
+    m_t2i = recall_t2i(sim_t, names, ks=(1, 5, 10))
 
-    print(f"Split: {args.split} | mode: FULL_RETRIEVAL | pairs: {len(names)}")
+    result = {
+        "mode": "full_retrieval",
+        "split": args.split,
+        "pairs": int(len(names)),
+        "batch_size": int(bs),
+        "device": str(device),
+        "ckpt": ckpt_info,
+        **m_i2t,
+        **m_t2i,
+    }
 
-    print("FULL i2t:", ", ".join([
-        f"R@1={m1['i2t_R@1']:.3f}",
-        f"R@5={m1['i2t_R@5']:.3f}",
-        f"R@10={m1['i2t_R@10']:.3f}",
-    ]))
+    # nice console output
+    print(f"FULL_RETRIEVAL | split={args.split} | pairs={len(names)}")
+    print("i2t:", f"R@1={result['i2t_R@1']:.3f}", f"R@5={result['i2t_R@5']:.3f}", f"R@10={result['i2t_R@10']:.3f}")
+    print("t2i:", f"R@1={result['t2i_R@1']:.3f}", f"R@5={result['t2i_R@5']:.3f}", f"R@10={result['t2i_R@10']:.3f}")
 
-    print("FULL t2i:", ", ".join([
-        f"R@1={m2['t2i_R@1']:.3f}",
-        f"R@5={m2['t2i_R@5']:.3f}",
-        f"R@10={m2['t2i_R@10']:.3f}",
-    ]))
-
+    if args.out_json:
+        out_path = Path(args.out_json)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("Saved:", str(out_path))
 
 
 if __name__ == "__main__":

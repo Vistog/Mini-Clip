@@ -20,6 +20,9 @@ ENV/
 # =========================
 runs/
 checkpoints/
+# sweep generated configs
+configs/_sweeps/
+
 *.pt
 *.pth
 *.ckpt
