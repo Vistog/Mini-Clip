@@ -1,0 +1,58 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+mini-clip/
+ENV/
+
+# =========================
+# ML / Experiments
+# =========================
+runs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# TensorBoard / logs
+logs/
+events.out.tfevents.*
+
+# =========================
+# Datasets
+# =========================
+data/
+datasets/
+*.zip
+*.tar
+*.tar.gz
+
+# =========================
+# HuggingFace cache
+# =========================
+.cache/
+~/.cache/
+huggingface/
+
+# =========================
+# VSCode / IDE
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# OS
+# =========================
+.DS_Store
+Thumbs.db
