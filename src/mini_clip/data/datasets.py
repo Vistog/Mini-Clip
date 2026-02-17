@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import random
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional, Callable, Any
 
 import torch
 from torch.utils.data import Dataset
@@ -59,11 +59,19 @@ def _load_captions(token_file: str) -> Dict[str, List[str]]:
 
 class Flickr8kDataset(Dataset):
     """
-    Возвращает пары (image_tensor, caption_str) для заданного split.
+    Возвращает пары (image_tensor, caption_str, img_name) для заданного split.
     """
-    def __init__(self, root: str, split: str, image_size: int, train: bool):
+
+    def __init__(
+        self,
+        root: str,
+        split: str,
+        image_size: int,
+        train: bool,
+        transform: Optional[Callable[[Image.Image], Any]] = None,  # CHANGED: добавили transform как аргумент
+    ):
         """
-        root: data/flickr8k (как в структуре выше)
+        root: data/flickr8k
         split: "train" | "val" | "test"
         """
         root = os.path.abspath(root)
@@ -101,7 +109,11 @@ class Flickr8kDataset(Dataset):
             raise RuntimeError("No (image, caption) pairs found. Check paths / files.")
 
         self.pairs = pairs
-        self.transform = build_image_transform(image_size=image_size, train=train)
+
+        self.transform = transform if transform is not None else build_image_transform(
+            image_size=image_size,
+            train=train,
+        )
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -109,6 +121,7 @@ class Flickr8kDataset(Dataset):
     def __getitem__(self, idx: int):
         img_name, caption = self.pairs[idx]
         path = os.path.join(self.images_dir, img_name)
+
         with Image.open(path) as im:
             im = im.convert("RGB")
             x = self.transform(im)
