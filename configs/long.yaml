@@ -1,0 +1,28 @@
+model:
+  embed_dim: 512
+  image_encoder:
+    name: resnet50
+    pretrained: true
+    trainable: false
+  text_encoder:
+    name: distilbert-base-uncased
+    trainable: false
+    pooling: mean
+    unfreeze_last_n: 4
+  projection:
+    type: linear  # linear или mlp
+    hidden_dim: 1024
+    dropout: 0.0
+  temperature:
+    learnable: true
+    init: 0.07
+
+train:
+  epochs: 100
+  lr: 1.0e-4
+  lr_text: 1.0e-5
+  lr_image: 1.0e-5
+  weight_decay: 1.0e-4
+  log_every: 20
+  save_every: 10
+  amp: true
