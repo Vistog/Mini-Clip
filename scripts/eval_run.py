@@ -48,7 +48,10 @@ def main():
             "--out_json", str(out_json),
         ]
         print("Running:", " ".join(cmd))
-        subprocess.check_call(cmd)
+        try:
+            subprocess.check_call(cmd)
+        except subprocess.CalledProcessError as e:
+            print(f"[WARN] eval failed for split={split}: {e}")
 
     print("Done. Saved full eval JSONs in:", str(run_dir))
 

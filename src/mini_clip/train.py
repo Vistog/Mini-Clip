@@ -61,7 +61,11 @@ def save_ckpt(model: nn.Module, optim: torch.optim.Optimizer, epoch: int, run_di
 
 
 def main():
-    cfg = load_config("configs/base.yaml", os.environ.get("OVERRIDE_CFG"))
+    try:
+        cfg = load_config("configs/base.yaml", os.environ.get("OVERRIDE_CFG"))
+    except Exception as e:
+        print("CONFIG LOAD FAILED:", e)
+        raise
     set_seed(int(cfg["seed"]))
 
     run_dir = make_run_dir(cfg["run"]["out_dir"], cfg["run"].get("name"))

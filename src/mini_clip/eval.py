@@ -85,6 +85,75 @@ def build_name_to_indices(names: List[str]) -> Dict[str, List[int]]:
 
 
 @torch.no_grad()
+def recall_i2t_chunked(
+    img_embs: torch.Tensor,
+    txt_embs: torch.Tensor,
+    names: List[str],
+    ks=(1, 5, 10),
+    chunk: int = 512,
+) -> Dict[str, float]:
+    """
+    Считаем i2t Recall@K без полной матрицы N×N.
+    img_embs, txt_embs: [N, D] на CPU (лучше float32)
+    """
+    name2idx = build_name_to_indices(names)
+    N = img_embs.size(0)
+    max_k = max(ks)
+
+    correct = {k: 0 for k in ks}
+
+    txt_embs_t = txt_embs.t().contiguous()  # [D, N]
+
+    for start in range(0, N, chunk):
+        end = min(N, start + chunk)
+        sims = img_embs[start:end] @ txt_embs_t  # [chunk, N] на CPU
+        topk = sims.topk(max_k, dim=1).indices   # [chunk, max_k]
+
+        for i_local, i in enumerate(range(start, end)):
+            gt = set(name2idx[names[i]])
+            row = topk[i_local].tolist()
+            for k in ks:
+                if any(j in gt for j in row[:k]):
+                    correct[k] += 1
+
+    return {f"i2t_R@{k}": correct[k] / N for k in ks}
+
+
+@torch.no_grad()
+def recall_t2i_chunked(
+    img_embs: torch.Tensor,
+    txt_embs: torch.Tensor,
+    names: List[str],
+    ks=(1, 5, 10),
+    chunk: int = 512,
+) -> Dict[str, float]:
+    """
+    t2i Recall@K без полной матрицы: текст сравниваем со всеми изображениями.
+    """
+    name2idx = build_name_to_indices(names)
+    N = txt_embs.size(0)
+    max_k = max(ks)
+
+    correct = {k: 0 for k in ks}
+    img_embs_t = img_embs.t().contiguous()  # [D, N]
+
+    for start in range(0, N, chunk):
+        end = min(N, start + chunk)
+        sims = txt_embs[start:end] @ img_embs_t
+        topk = sims.topk(max_k, dim=1).indices
+
+        for i_local, i in enumerate(range(start, end)):
+            gt = set(name2idx[names[i]])
+            row = topk[i_local].tolist()
+            for k in ks:
+                if any(j in gt for j in row[:k]):
+                    correct[k] += 1
+
+    return {f"t2i_R@{k}": correct[k] / N for k in ks}
+
+
+
+@torch.no_grad()
 def recall_i2t(sim: torch.Tensor, names: List[str], ks=(1, 5, 10)) -> Dict[str, float]:
     """
     Image->Text: у одной картинки 5 captions => multi-positive.

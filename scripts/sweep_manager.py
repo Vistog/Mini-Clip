@@ -397,13 +397,13 @@ def main():
     cfg = SweepConfig()
     PY = os.sys.executable
 
-    # ---- GRID: редактируй тут ----
+    # ---- GRID ----
     grid = {
-        "model.text_encoder.pooling": ["mean", "cls"],
-        "model.text_encoder.unfreeze_last_n": [0, 1, 2, 4],
-        "train.lr_text": [1e-5, 2e-5, 5e-5],
-        "model.projection.type": ["linear", "mlp"],
-        "train.weight_decay": [0.01, 0.05],
+        "model.text_encoder.pooling": ["mean"],
+        "model.text_encoder.unfreeze_last_n": [0, 2, 4],
+        "train.lr_text": [1e-5, 5e-5],
+        "model.projection.type": ["linear"],
+        "train.weight_decay": [0.01],
         "data.batch_size": [128],
         "train.epochs": [10],
         "train.lr": [1e-3],
