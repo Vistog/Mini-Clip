@@ -44,3 +44,15 @@ train:
   log_every: 20
   save_every: 10
   amp: true
+
+augment:
+  enabled: true
+  rrc_scale: [0.7, 1.0]
+  hflip_p: 0.5
+  color_jitter:
+    enabled: true
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.1
+    hue: 0.05
+

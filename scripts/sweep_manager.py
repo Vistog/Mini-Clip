@@ -400,13 +400,13 @@ def main():
     # ---- GRID ----
     grid = {
         "model.text_encoder.pooling": ["mean"],
-        "model.text_encoder.unfreeze_last_n": [0, 2, 4],
-        "train.lr_text": [1e-5, 5e-5],
-        "model.projection.type": ["linear"],
+        "model.text_encoder.unfreeze_last_n": [2, 4, 6],
+        "train.lr_text": [1e-5, 5e-6, 1e-6],
+        "model.projection.type": ["linear", "mlp"],
         "train.weight_decay": [0.01],
         "data.batch_size": [128],
         "train.epochs": [10],
-        "train.lr": [1e-3],
+        "train.lr": [1e-4],
     }
 
 
