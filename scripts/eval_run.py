@@ -37,7 +37,6 @@ def main():
 
     ckpt = Path(args.ckpt) if args.ckpt else find_last_ckpt(run_dir)
 
-    # call: python -m mini_clip.eval ...
     for split in ["val", "test"]:
         out_json = run_dir / f"full_eval_{split}.json"
         cmd = [
